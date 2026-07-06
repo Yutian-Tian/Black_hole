@@ -207,10 +207,10 @@ def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-8):
 
 # ===================== 4. 主程序（多应力计算 & 绘图） =====================
 def main():
-    p = 2.0
+    p = 1.1
     t_step = 0.01
     n_max = 1600
-    sigma_list = [0.2, 0.4, 0.6, 1.0, 3.0]
+    sigma_list = [0.2]
     all_curves = []
 
     print("开始使用 Numba 加速的 Picard 全局迭代法计算...")
@@ -224,25 +224,28 @@ def main():
         print(f"   耗时: {end_t - start_t:.2f} 秒")
         
         dimensionless_time = np.arange(0, n_max + 1) * t_step
-        all_curves.append((sigma, dimensionless_time, strain))
+        # ---------- 新增：计算应变率 dλ/dt ----------
+        strain_rate = np.gradient(strain, t_step)
+        all_curves.append((sigma, dimensionless_time, strain, strain_rate))
 
     total_end = time.time()
     print(f"\n✅ 全部计算完成！总耗时: {total_end - total_start:.2f} 秒")
 
-    # 保存数据
+    # 保存数据（扩展：同时保存应变率）
     df_all = pd.DataFrame()
-    for sigma, t, strain in all_curves:
+    for sigma, t, strain, strain_rate in all_curves:
         df_all[f"sigma_{sigma}_time"] = t
         df_all[f"sigma_{sigma}_strain"] = strain
+        df_all[f"sigma_{sigma}_strain_rate"] = strain_rate
     csv_path = os.path.join(save_path, "creep_strains_numba_picard.csv")
     df_all.to_csv(csv_path, index=False, float_format='%.6f')
     print(f"✅ 数据已保存至 {csv_path}")
 
-    # ===================== 5. 绘图（文献图4a复现） =====================
+    # ===================== 5. 绘图（文献图4a复现：拉伸应变） =====================
     fig, ax = plt.subplots(figsize=(14, 10))
     colors = ['#7b2d8e', '#d62728', '#2ca02c', '#000000', '#1f77b4']
 
-    for i, (sigma, t, strain) in enumerate(all_curves):
+    for i, (sigma, t, strain, strain_rate) in enumerate(all_curves):
         # 文献图4(a) 纵轴为拉伸应变 (λ - 1)，取半对数
         ax.semilogy(t, strain - 1.0,
                     color=colors[i % len(colors)],
@@ -278,6 +281,46 @@ def main():
     fig_name = os.path.join(save_path, "creep_visualization_numba.png")
     plt.savefig(fig_name, dpi=savefig_dpi, bbox_inches='tight', facecolor='white')
     print(f"✅ 图片已保存至 {fig_name}")
+
+    # ===================== 6. 新增：应变率-时间图（双对数坐标） =====================
+    fig2, ax2 = plt.subplots(figsize=(14, 10))
+
+    ax2.set_yscale('log')
+
+    for i, (sigma, t, strain, strain_rate) in enumerate(all_curves):
+        # 移除时间零点附近的可能非正值，避免对数坐标警告
+        mask = (strain_rate > 0) & (t > 0)
+        ax2.plot(t[mask], strain_rate[mask],
+                   color=colors[i % len(colors)],
+                   linewidth=lines_linewidth,
+                   label=f'$\\sigma_0 = {sigma} G_0$')
+
+    ax2.set_xlabel(f'Scaled time $\\beta t$', fontsize=label_fontsize)
+    ax2.set_ylabel(f'Strain rate $d\\lambda/dt$', fontsize=label_fontsize)
+    ax2.set_title(f'Creep strain rate of Vitrimers', fontsize=title_fontsize, pad=20)
+
+    ax2.legend(fontsize=legend_fontsize, loc='best', framealpha=0.9, edgecolor='none')
+    ax2.grid(True, linestyle=':', alpha=grid_alpha, linewidth=grid_linewidth)
+
+    # 刻度样式（与第一张图一致）
+    ax2.tick_params(axis='both', which='major',
+                    direction=xtick_direction, top=xtick_top, right=ytick_right,
+                    bottom=True, left=True, width=xtick_major_width,
+                    length=xtick_major_size, labelsize=tick_fontsize)
+    ax2.minorticks_on()
+    ax2.tick_params(axis='both', which='minor',
+                    direction=xtick_direction, top=xtick_top, right=ytick_right,
+                    bottom=True, left=True, width=xtick_major_width * 0.75,
+                    length=xtick_major_size * 0.5)
+
+    for spine in ax2.spines.values():
+        spine.set_linewidth(axes_linewidth)
+
+    plt.tight_layout()
+
+    fig_name2 = os.path.join(save_path, "creep_strain_rate_numba.png")
+    plt.savefig(fig_name2, dpi=savefig_dpi, bbox_inches='tight', facecolor='white')
+    print(f"✅ 应变率图已保存至 {fig_name2}")
 
 if __name__ == "__main__":
     main()

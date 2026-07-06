@@ -1,0 +1,4 @@
+Fitted parameters:
+p = 1.109988e+00
+G0 = 4.210373e-02
+beta = 4.510039e-01
