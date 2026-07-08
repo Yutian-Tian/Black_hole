@@ -20,7 +20,7 @@ math_bf = 'Times New Roman:bold'
 title_fontsize = 35
 label_fontsize = 35
 tick_fontsize = 35
-legend_fontsize = 25
+legend_fontsize = 22  # 稍微缩小图例，避免两条线文本过挤
 legend_title_fontsize = 35
 
 axes_linewidth = 2
@@ -100,25 +100,17 @@ def solve_initial_lambda(sigma, p, tol=1e-10, max_iter=100):
 
 @njit(cache=True)
 def ConstitutiveEqn_val(strain_hist, t_idx, p, t_step, current_val):
-    """
-    计算当前时刻的无量纲应力。
-    【优化点】：不再复制 strain 数组，直接传入 current_val 替代 strain[t_idx]
-    """
     if t_idx == 0:
         return current_val**(p-1) - current_val**(-0.5*p-1)
     
-    # 第一项：初始链的贡献（衰减项）
     term1 = np.exp(-t_idx * t_step) * (current_val**(p-1) - current_val**(-0.5*p-1))
     
-    # 第二项：新形成链的积分贡献（梯形法，直接展开积分项）
     term2 = 0.0
     for i in range(t_idx):
-        # A(n; i)
         exp_i = np.exp(-(t_idx - i) * t_step)
         lam_i = strain_hist[i]
         A_i = exp_i * (current_val**(p-1) / lam_i**p - lam_i**(0.5*p) / current_val**(0.5*p+1))
         
-        # A(n; i+1)
         exp_i1 = np.exp(-(t_idx - (i+1)) * t_step)
         lam_i1 = strain_hist[i+1]
         A_i1 = exp_i1 * (current_val**(p-1) / lam_i1**p - lam_i1**(0.5*p) / current_val**(0.5*p+1))
@@ -129,33 +121,56 @@ def ConstitutiveEqn_val(strain_hist, t_idx, p, t_step, current_val):
 
 @njit(cache=True)
 def solve_current_step(strain_hist, n, p, t_step, sigma, tol=1e-8, max_iter_bisect=100):
-    """
-    利用二分法求解当前时间步 n 的应变 λ
-    积分时使用历史数组 strain_hist（来自上一次 Picard 全局迭代）
-    """
-    x0 = strain_hist[n-1]  # 从上一时刻开始找根
-    
-    # 寻找二分法的括号区间 [a, b] 包含零点
+    x0 = strain_hist[n-1]
     a = x0
     b = x0 * 2.0
     fa = ConstitutiveEqn_val(strain_hist, n, p, t_step, a) - sigma
     fb = ConstitutiveEqn_val(strain_hist, n, p, t_step, b) - sigma
     
-    # 如果同号，扩大 b 的范围，直到异号
-    while fa * fb > 0 and b < 1e6:
-        b *= 2.0
-        fb = ConstitutiveEqn_val(strain_hist, n, p, t_step, b) - sigma
+    max_extend = 50
+    extend_count = 0
     
-    # 如果扩大后依然没有异号，退回到最宽的安全区间
+    while fa * fb > 0 and extend_count < max_extend:
+        a_candidate = a * 0.5
+        if a_candidate < 1e-10:
+            a_candidate = 1e-10
+        fa_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, a_candidate) - sigma
+        
+        b_candidate = b * 2.0
+        if b_candidate > 1e30:
+            b_candidate = 1e30
+        fb_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, b_candidate) - sigma
+        
+        if fa * fb_new < 0:
+            b = b_candidate
+            fb = fb_new
+            break
+        if fa_new * fb < 0:
+            a = a_candidate
+            fa = fa_new
+            break
+        if fa_new * fb_new < 0:
+            a = a_candidate
+            fa = fa_new
+            b = b_candidate
+            fb = fb_new
+            break
+        
+        a = a_candidate
+        fa = fa_new
+        b = b_candidate
+        fb = fb_new
+        extend_count += 1
+        
+        if a <= 1e-10 and b >= 1e30:
+            break
+    
     if fa * fb > 0:
-        a = x0
-        b = 1e6
-        fa = ConstitutiveEqn_val(strain_hist, n, p, t_step, a) - sigma
-        fb = ConstitutiveEqn_val(strain_hist, n, p, t_step, b) - sigma
-        if fa * fb > 0:
-            return b  # 理论上不会发生，返回上限作为兜底
+        if abs(fa) < abs(fb):
+            return a
+        else:
+            return b
     
-    # 二分法主循环
     for _ in range(max_iter_bisect):
         c = (a + b) / 2.0
         fc = ConstitutiveEqn_val(strain_hist, n, p, t_step, c) - sigma
@@ -171,12 +186,9 @@ def solve_current_step(strain_hist, n, p, t_step, sigma, tol=1e-8, max_iter_bise
     return (a + b) / 2.0
 
 @njit(cache=True)
-def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-8):
-    """使用 Picard 全局迭代法计算整条蠕变曲线"""
-    # 初始化应变曲线
+def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-8, omega=0.9):
     strain = np.ones(n_max + 1)
     strain[0] = solve_initial_lambda(sigma, p)
-    # 给初始曲线一个微弱增长的趋势（帮助更快跳出亚稳态）
     for i in range(1, n_max + 1):
         strain[i] = strain[0] * np.exp(i * t_step * 0.01)
     
@@ -184,13 +196,12 @@ def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-8):
         new_strain = np.zeros(n_max + 1)
         new_strain[0] = strain[0]
         
-        # 逐时间步求解
         for n in range(1, n_max + 1):
-            # 注意：这里传递的历史数组是上一次全局迭代的 `strain`
-            # 让当前应变和历史应变在全局迭代中同时演化
             new_strain[n] = solve_current_step(strain, n, p, t_step, sigma)
         
-        # 计算收敛误差
+        for i in range(n_max + 1):
+            new_strain[i] = omega * new_strain[i] + (1.0 - omega) * strain[i]
+        
         diff = 0.0
         for i in range(n_max + 1):
             d = new_strain[i] - strain[i]
@@ -205,61 +216,109 @@ def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-8):
             
     return strain
 
-# ===================== 4. 主程序（多应力计算 & 绘图） =====================
+# ===================== 4. 新增：解析公式解函数 =====================
+def compute_analytical_creep(sigma, p, t_vals, beta=1.0, mu=1.0):
+    """
+    按照给定图片中的解析公式计算近似解。
+    注：返回的 t_vals 已视为无量纲时间 beta * t，代码中直接设 beta = 1。
+    """
+    # 1. 获取 lambda_0 (注意: 这里直接调用了数值求解部分，保证初始点严格对齐)
+    lambda0 = solve_initial_lambda(sigma, p)
+    
+    # 2. 计算 f'(lambda0) 和 f''(lambda0)
+    # 根据图片：f(lambda) = mu * (lambda^(p-1) - lambda^(-(p+1)))
+    # 一阶导数: f'(lambda) = mu * ((p-1)*lambda^(p-2) + (p+1)*lambda^(-(p+2)))
+    # 二阶导数: f''(lambda) = mu * ((p-1)*(p-2)*lambda^(p-3) - (p+1)*(p+2)*lambda^(-(p+3)))
+    f_prime = mu * ((p-1) * lambda0**(p-2) + (p+1) * lambda0**(-(p+2)))
+    f_double_prime = mu * ((p-1)*(p-2) * lambda0**(p-3) - (p+1)*(p+2) * lambda0**(-(p+3)))
+    
+    # 3. 计算系数 A
+    # A = beta * (lambda0^(p-1) - lambda0^(-(p+1))) / ((p-1)*lambda0^(p-2) + (p+1)*lambda0^(-(p+2)))
+    # (分母项即为 f'(lambda0)/mu)
+    numer_A = lambda0**(p-1) - lambda0**(-(p+1))
+    denom_A = (p-1) * lambda0**(p-2) + (p+1) * lambda0**(-(p+2))
+    A = beta * numer_A / denom_A
+    
+    # 4. 计算系数 B
+    # B = A/2 * [ beta - A * f''/f' - (2*p*beta*mu) / (lambda0^2 * f') ]
+    term1 = beta
+    term2 = A * f_double_prime / f_prime
+    term3 = (2 * p * beta * mu) / (lambda0**2 * f_prime)
+    B = (A / 2.0) * (term1 - term2 - term3)
+    
+    # 5. 构造解析解 lambda(t) = lambda0 + A*t + B*t^2
+    analytical_lambda = lambda0 + A * t_vals + B * t_vals**2
+    return analytical_lambda
+
+# ===================== 5. 主程序 =====================
 def main():
-    p = 1.1
+    p = 2.0
     t_step = 0.01
-    n_max = 1600
-    sigma_list = [0.2]
+    n_max = 4500
+    sigma_list = [0.005]
     all_curves = []
 
-    print("开始使用 Numba 加速的 Picard 全局迭代法计算...")
+    print("开始使用 Numba 加速的阻尼 Picard 迭代法计算...")
     total_start = time.time()
     
     for sigma in sigma_list:
         print(f"\n--- 计算 σ = {sigma} ---")
         start_t = time.time()
-        strain = compute_creep_picard_numba(sigma, p, t_step, n_max)
+        strain = compute_creep_picard_numba(sigma, p, t_step, n_max, omega=0.7)
         end_t = time.time()
         print(f"   耗时: {end_t - start_t:.2f} 秒")
         
         dimensionless_time = np.arange(0, n_max + 1) * t_step
-        # ---------- 新增：计算应变率 dλ/dt ----------
         strain_rate = np.gradient(strain, t_step)
-        all_curves.append((sigma, dimensionless_time, strain, strain_rate))
+        
+        # ---------- 新增：求解解析解 ----------
+        analytical_strain = compute_analytical_creep(sigma, p, dimensionless_time)
+        analytical_rate = np.gradient(analytical_strain, t_step)
+        
+        all_curves.append((sigma, dimensionless_time, strain, strain_rate, analytical_strain, analytical_rate))
 
     total_end = time.time()
     print(f"\n✅ 全部计算完成！总耗时: {total_end - total_start:.2f} 秒")
 
-    # 保存数据（扩展：同时保存应变率）
+    # 保存数据（扩展：同时保存解析解数据）
     df_all = pd.DataFrame()
-    for sigma, t, strain, strain_rate in all_curves:
+    for sigma, t, strain, strain_rate, analytical_strain, analytical_rate in all_curves:
         df_all[f"sigma_{sigma}_time"] = t
         df_all[f"sigma_{sigma}_strain"] = strain
         df_all[f"sigma_{sigma}_strain_rate"] = strain_rate
+        df_all[f"sigma_{sigma}_analytical_strain"] = analytical_strain
+        df_all[f"sigma_{sigma}_analytical_rate"] = analytical_rate
+        
     csv_path = os.path.join(save_path, "creep_strains_numba_picard.csv")
     df_all.to_csv(csv_path, index=False, float_format='%.6f')
     print(f"✅ 数据已保存至 {csv_path}")
 
-    # ===================== 5. 绘图（文献图4a复现：拉伸应变） =====================
+    # ===================== 6. 绘图 =====================
+    # 绘制图1：蠕变主图 (拉伸应变 + 解析解)
     fig, ax = plt.subplots(figsize=(14, 10))
     colors = ['#7b2d8e', '#d62728', '#2ca02c', '#000000', '#1f77b4']
 
-    for i, (sigma, t, strain, strain_rate) in enumerate(all_curves):
-        # 文献图4(a) 纵轴为拉伸应变 (λ - 1)，取半对数
+    for i, (sigma, t, strain, strain_rate, analytical_strain, analytical_rate) in enumerate(all_curves):
+        color = colors[i % len(colors)]
+        # 数值解（实线）
         ax.semilogy(t, strain - 1.0,
-                    color=colors[i % len(colors)],
+                    color=color,
                     linewidth=lines_linewidth,
-                    label=f'$\\sigma_0 = {sigma} G_0$')
+                    label=f'$\\sigma_0 = {sigma} G_0$ (Numerical)')
+        # 解析解（虚线）
+        ax.semilogy(t, analytical_strain - 1.0,
+                    color=color,
+                    linewidth=lines_linewidth,
+                    linestyle='--',
+                    label=f'$\\sigma_0 = {sigma} G_0$ (Analytical)')
 
     ax.set_xlabel(f'Scaled time $\\beta t$', fontsize=label_fontsize)
-    ax.set_ylabel(f'Tensile creep strain $(\lambda - 1)$', fontsize=label_fontsize)
+    ax.set_ylabel(f'Tensile creep strain $(\\lambda - 1)$', fontsize=label_fontsize)
     ax.set_title(f'Creep of Vitrimers', fontsize=title_fontsize, pad=20)
 
     ax.legend(fontsize=legend_fontsize, loc='upper left', framealpha=0.9, edgecolor='none')
     ax.grid(True, linestyle=':', alpha=grid_alpha, linewidth=grid_linewidth)
 
-    # 刻度样式
     ax.tick_params(axis='both', which='major',
                    direction=xtick_direction, top=xtick_top, right=ytick_right,
                    bottom=True, left=True, width=xtick_major_width,
@@ -270,30 +329,35 @@ def main():
                    bottom=True, left=True, width=xtick_major_width * 0.75,
                    length=xtick_major_size * 0.5)
 
-    ax.set_xlim(0.0, 16.0)
-    ax.set_ylim(0.01, 1.2e5)  # 调整为 λ-1 的量级
 
     for spine in ax.spines.values():
         spine.set_linewidth(axes_linewidth)
 
     plt.tight_layout()
-
     fig_name = os.path.join(save_path, "creep_visualization_numba.png")
     plt.savefig(fig_name, dpi=savefig_dpi, bbox_inches='tight', facecolor='white')
     print(f"✅ 图片已保存至 {fig_name}")
 
-    # ===================== 6. 新增：应变率-时间图（双对数坐标） =====================
+    # 绘制图2：应变率图
     fig2, ax2 = plt.subplots(figsize=(14, 10))
-
     ax2.set_yscale('log')
 
-    for i, (sigma, t, strain, strain_rate) in enumerate(all_curves):
-        # 移除时间零点附近的可能非正值，避免对数坐标警告
+    for i, (sigma, t, strain, strain_rate, analytical_strain, analytical_rate) in enumerate(all_curves):
+        color = colors[i % len(colors)]
+        
         mask = (strain_rate > 0) & (t > 0)
         ax2.plot(t[mask], strain_rate[mask],
-                   color=colors[i % len(colors)],
-                   linewidth=lines_linewidth,
-                   label=f'$\\sigma_0 = {sigma} G_0$')
+                 color=color,
+                 linewidth=lines_linewidth,
+                 label=f'$\\sigma_0 = {sigma} G_0$ (Numerical)')
+        
+        # 在较小时间范围内添加解析解率作为比较
+        mask_ana = (analytical_rate > 0) & (t > 0)
+        ax2.plot(t[mask_ana], analytical_rate[mask_ana],
+                 color=color,
+                 linewidth=lines_linewidth,
+                 linestyle='--',
+                 label=f'$\\sigma_0 = {sigma} G_0$ (Analytical)')
 
     ax2.set_xlabel(f'Scaled time $\\beta t$', fontsize=label_fontsize)
     ax2.set_ylabel(f'Strain rate $d\\lambda/dt$', fontsize=label_fontsize)
@@ -302,7 +366,6 @@ def main():
     ax2.legend(fontsize=legend_fontsize, loc='best', framealpha=0.9, edgecolor='none')
     ax2.grid(True, linestyle=':', alpha=grid_alpha, linewidth=grid_linewidth)
 
-    # 刻度样式（与第一张图一致）
     ax2.tick_params(axis='both', which='major',
                     direction=xtick_direction, top=xtick_top, right=ytick_right,
                     bottom=True, left=True, width=xtick_major_width,
@@ -317,7 +380,6 @@ def main():
         spine.set_linewidth(axes_linewidth)
 
     plt.tight_layout()
-
     fig_name2 = os.path.join(save_path, "creep_strain_rate_numba.png")
     plt.savefig(fig_name2, dpi=savefig_dpi, bbox_inches='tight', facecolor='white')
     print(f"✅ 应变率图已保存至 {fig_name2}")

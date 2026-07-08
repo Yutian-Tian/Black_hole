@@ -195,17 +195,25 @@ def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=100, tol=1e-6):
     strain = np.ones(n_max + 1)
     strain[0] = solve_initial_lambda(sigma, p)
     for i in range(1, n_max + 1):
-        strain[i] = strain[0] + (strain[0] * 0.01) * i * t_step   # 线性初值
+        strain[i] = strain[0] + (strain[0] * 0.01) * i * t_step
     
     for k in range(max_iter):
         new_strain = np.zeros(n_max + 1)
         new_strain[0] = strain[0]
         for n in range(1, n_max + 1):
             new_strain[n] = solve_current_step(strain, n, p, t_step, sigma)
+        
         diff = np.max(np.abs(new_strain - strain))
         strain = new_strain
+        
+        # 每 10 次迭代或收敛时打印一次
+        if k % 10 == 0 or diff < tol:
+            print("Picard iter", k+1, "max residual =", diff)
+        
         if diff < tol:
+            print("Converged after", k+1, "iterations.")
             break
+    
     return strain
 
 # ==================== 4. 模型预测接口（改为按时间范围求解） ====================
@@ -243,9 +251,9 @@ def main():
 
     # ---------- 2. 模型参数 ----------
     params = {
-        'p': 0.45,
-        'G0': 3.46,   # 剪切模量 μ (Pa)
-        'beta': 12.7   # 松弛速率 (1/s)
+        'p': 1.2,
+        'G0': 6.13,   # 剪切模量 μ (Pa)
+        'beta': 59.5   # 松弛速率 (1/s)
     }
     sigma_real = 1e-3       # 实际应力 (Pa)
     dt_step = 0.01          # 无量纲时间步长（可调节精度）
