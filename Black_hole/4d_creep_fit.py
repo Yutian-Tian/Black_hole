@@ -100,8 +100,8 @@ def load_data(filepath):
     else:
         raise ValueError(f"不支持的文件格式: {ext}")
     
-    strain_rate = df.iloc[:, 0].values 
-    stress = df.iloc[:, 1].values   # 备用
+    strain_rate = 10*df.iloc[:, 0].values 
+    stress = 10*df.iloc[:, 1].values   # 备用
 
     return strain_rate, stress
 
@@ -115,7 +115,7 @@ def solve_initial_lambda(sigma, p, tol=1e-10, max_iter=100):
     fa = a**(p-1) - a**(-p-1) - sigma
     fb = b**(p-1) - b**(-p-1) - sigma
     while fa * fb > 0:
-        if b > 100:
+        if b > 1e30:
             break
         a *= 0.5
         b *= 2.0
@@ -185,7 +185,7 @@ def solve_current_step_fast(strain_hist, n, p, t_step, sigma, I1, I2,
             fa = ConstitutiveEqn_val_fast(a, p, n, t_step, I1[n], I2[n]) - sigma
         else:
             b *= 2.0
-            if b > 1e6: b = 1e6; break
+            if b > 1e30: b = 1e30; break
             fb = ConstitutiveEqn_val_fast(b, p, n, t_step, I1[n], I2[n]) - sigma
 
     if fa * fb > 0:

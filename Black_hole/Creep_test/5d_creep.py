@@ -107,12 +107,17 @@ def ConstitutiveEqn_val(strain_hist, t_idx, p, t_step, current_val):
     
     term2 = 0.0
     for i in range(t_idx):
+        # 左端点 (t_i)
         exp_i = np.exp(-(t_idx - i) * t_step)
         lam_i = strain_hist[i]
         A_i = exp_i * (current_val**(p-1) / lam_i**p - lam_i**(0.5*p) / current_val**(0.5*p+1))
         
+        # 右端点 (t_{i+1})：若到达当前步，使用 current_val 而非历史值
         exp_i1 = np.exp(-(t_idx - (i+1)) * t_step)
-        lam_i1 = strain_hist[i+1]
+        if i + 1 == t_idx:
+            lam_i1 = current_val
+        else:
+            lam_i1 = strain_hist[i+1]
         A_i1 = exp_i1 * (current_val**(p-1) / lam_i1**p - lam_i1**(0.5*p) / current_val**(0.5*p+1))
         
         term2 += 0.5 * (A_i + A_i1) * t_step
@@ -122,55 +127,71 @@ def ConstitutiveEqn_val(strain_hist, t_idx, p, t_step, current_val):
 @njit(cache=True)
 def solve_current_step(strain_hist, n, p, t_step, sigma, tol=1e-12, max_iter_bisect=100):
     x0 = strain_hist[n-1]
-    a = x0
-    b = x0 * 2.0
+    
+    # 更鲁棒的初始区间搜索
+    a = x0 * 0.95
+    if a < 1.0:
+        a = 1.0
+    b = x0 * 1.5
+    
     fa = ConstitutiveEqn_val(strain_hist, n, p, t_step, a) - sigma
     fb = ConstitutiveEqn_val(strain_hist, n, p, t_step, b) - sigma
     
-    max_extend = 50
+    # 自适应扩展上下界
+    max_extend = 60
     extend_count = 0
     
     while fa * fb > 0 and extend_count < max_extend:
-        a_candidate = a * 0.5
-        if a_candidate < 1e-10:
-            a_candidate = 1e-10
-        fa_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, a_candidate) - sigma
+        # 尝试向下扩展
+        a_new = a * 0.5
+        if a_new < 1.0:
+            a_new = 1.0
+        fa_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, a_new) - sigma
         
-        b_candidate = b * 2.0
-        if b_candidate > 1e30:
-            b_candidate = 1e30
-        fb_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, b_candidate) - sigma
+        # 尝试向上扩展
+        b_new = b * 2.0
+        if b_new > 1e30:
+            b_new = 1e30
+        fb_new = ConstitutiveEqn_val(strain_hist, n, p, t_step, b_new) - sigma
         
+        # 优先选择能包根的方向
         if fa * fb_new < 0:
-            b = b_candidate
+            a = a
+            fa = fa
+            b = b_new
             fb = fb_new
             break
-        if fa_new * fb < 0:
-            a = a_candidate
+        elif fa_new * fb < 0:
+            a = a_new
             fa = fa_new
+            b = b
+            fb = fb
             break
-        if fa_new * fb_new < 0:
-            a = a_candidate
+        elif fa_new * fb_new < 0:
+            a = a_new
             fa = fa_new
-            b = b_candidate
+            b = b_new
             fb = fb_new
             break
         
-        a = a_candidate
+        # 若仍未包根，同时扩展
+        a = a_new
         fa = fa_new
-        b = b_candidate
+        b = b_new
         fb = fb_new
         extend_count += 1
         
-        if a <= 1e-10 and b >= 1e30:
+        if a <= 1.0 and b >= 1e30:
             break
     
     if fa * fb > 0:
+        # 无法包根，返回误差较小的一侧
         if abs(fa) < abs(fb):
             return a
         else:
             return b
     
+    # 标准二分法
     for _ in range(max_iter_bisect):
         c = (a + b) / 2.0
         fc = ConstitutiveEqn_val(strain_hist, n, p, t_step, c) - sigma
@@ -244,9 +265,9 @@ def compute_creep_picard_numba(sigma, p, t_step, n_max, max_iter=40, tol=1e-12, 
 # ===================== 4. 主程序 =====================
 def main():
     p = 2.0
-    t_step = 0.005
-    n_max = 16000
-    sigma_list = [0.002]
+    t_step = 0.01
+    n_max = 4000
+    sigma_list = [0.02]
     all_curves = []
 
     print("开始使用 Numba 加速的阻尼 Picard 迭代法计算... (初始解已替换为文献解析插值)")
