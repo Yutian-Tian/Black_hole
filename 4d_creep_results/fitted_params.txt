@@ -1,0 +1,9 @@
+# 拟合参数
+# Global 3-Parameter Fit (μ, p, β)
+# Fitting strategy: Last 60% of data
+
+mu   = 9.99987234e-02    # Elastic modulus
+p    = 1.73887235e+00    # Constitutive exponent
+beta = 3.91436755e+00    # Chain exchange rate
+loss = 1.14437047e+03
+success = False
