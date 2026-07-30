@@ -1,22 +1,3 @@
-"""
-creep_fitter.py — 2D聚合物网络参数拟合器
-==============================================
-
-功能：
-    - 读取实验数据（多组不同应力水平）
-    - 拟合全局参数 (μ, p, β)
-    - 拟合策略：关注后60%数据（指数增长段）
-    - 可视化拟合结果（应变率、应变、拟合误差）
-
-拟合模型：
-    全局三参数模型：
-        μ: 共享弹性模量
-        p: 共享本构指数  
-        β: 共享链交换速率（时间缩放）
-
-作者：基于4d_creep_robust_v2.py改写
-"""
-
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -85,19 +66,19 @@ def solve_initial_lambda(sigma, p, tol=1e-12, max_iter=50):
     return x
 
 @njit(cache=True)
-def compute_taylor_coeffs(lambda0, p, beta=1.0):
+def compute_taylor_coeffs(lambda0, p,):
     """计算泰勒展开系数"""
     l0 = lambda0
     pm1, pp1 = p - 1.0, p + 1.0
     f0 = l0 ** pm1 - l0 ** (-pp1)
     fp0 = pm1 * l0 ** (p - 2) + pp1 * l0 ** (-p - 2)
     fpp0 = pm1 * (p - 2) * l0 ** (p - 3) - pp1 * (p + 2) * l0 ** (-p - 3)
-    A = beta * f0 / fp0
-    B = (A / 2.0) * (beta - A * fpp0 / fp0 - 2.0 * p * beta / (l0 * l0 * fp0))
+    A = f0 / fp0
+    B = (A / 2.0) * (1 - A * fpp0 / fp0 - 2.0 * p / (l0 * l0 * fp0))
     return A, B
 
 @njit(cache=True)
-def build_initial_guess(lambda0, A, B, sigma, p, beta, n_max, t_step):
+def build_initial_guess(lambda0, A, B, sigma, p, n_max, t_step):
     """构建初始猜测"""
     strain = np.zeros(n_max + 1)
     strain[0] = lambda0
@@ -108,7 +89,7 @@ def build_initial_guess(lambda0, A, B, sigma, p, beta, n_max, t_step):
     else:
         alpha_short = np.exp(-17.0 / (1.0 + 17.0 * sigma * sigma))
         c = alpha_short * sigma
-        alpha_long = beta / (p - 1.0)
+        alpha_long = 1 / (p - 1.0)
         half_al2 = 0.5 * alpha_long * alpha_long
         for i in range(1, n_max + 1):
             t = i * t_step
@@ -117,18 +98,29 @@ def build_initial_guess(lambda0, A, B, sigma, p, beta, n_max, t_step):
     return strain
 
 @njit(cache=True)
-def compute_creep_gauss_seidel(sigma, p=2.0, beta=1.0, t_step=0.01, n_max=4000,
+def compute_creep_gauss_seidel(sigma, p=2.0, t_step=0.01, n_max=4000,
                                 max_iter=30, tol=1e-12, omega=0.7):
-    """Gauss-Seidel Picard迭代求解蠕变本构方程"""
+    """
+    Gauss-Seidel Picard迭代求解蠕变本构方程（修正版）
+    
+    参数:
+        sigma: 无量纲应力 σ/μ
+        p: 本构指数
+        t_step: 无量纲时间步长 dτ (注意：此处t_step实际对应dτ)
+        n_max: 时间步数
+    """
+    # 1. 初始弹性响应
     lambda0 = solve_initial_lambda(sigma, p)
-    A, B = compute_taylor_coeffs(lambda0, p, beta)
-    strain = build_initial_guess(lambda0, A, B, sigma, p, beta, n_max, t_step)
+    A, B = compute_taylor_coeffs(lambda0, p)
+    strain = build_initial_guess(lambda0, A, B, sigma, p, n_max, t_step)
 
+    # 2. 历史积分变量初始化
     S1 = np.zeros(n_max + 1)
     S2 = np.zeros(n_max + 1)
 
-    exp_dt = np.exp(-beta * t_step)
-    dtau = 1.0 - exp_dt
+    # 3. 离散化常数（核心修正）
+    exp_dt = np.exp(-t_step)          # 衰减因子 e^{-Δτ}
+    weight = 1.0 - exp_dt             # 积分权重 (1 - e^{-Δτ})
 
     for k in range(max_iter):
         max_diff = 0.0
@@ -136,46 +128,63 @@ def compute_creep_gauss_seidel(sigma, p=2.0, beta=1.0, t_step=0.01, n_max=4000,
 
         for n in range(1, n_max + 1):
             tau_n = n * t_step
-            exp_tn = np.exp(-beta * tau_n)
+            exp_tn = np.exp(-tau_n)   # e^{-τ_n} (用于弹性项)
 
+            # 上一时刻的应变
             lam_prev = strain[n - 1]
             lam_prev_p = lam_prev ** p
-            S1[n] = exp_dt * (S1[n - 1] + 1.0 / lam_prev_p)
-            S2[n] = exp_dt * (S2[n - 1] + lam_prev_p)
 
+            # --- 修正1：正确更新历史积分 S1, S2 ---
+            S1[n] = exp_dt * S1[n - 1] + weight * (1.0 / lam_prev_p)
+            S2[n] = exp_dt * S2[n - 1] + weight * lam_prev_p
+
+            # 当前时刻应变（初始取上一时刻值，后续迭代更新）
             lam = strain[n]
             pm1, pp1 = p - 1.0, p + 1.0
 
+            # 牛顿迭代求解当前 λ_n
             for _ in range(50):
                 lam_pm1 = lam ** pm1
                 lam_mpp1 = lam ** (-pp1)
-                f_val = (exp_tn * (lam_pm1 - lam_mpp1)
-                         + dtau * (lam_pm1 * S1[n] - lam_mpp1 * S2[n])
+
+                # --- 修正2：移除多余的 dtau 因子，直接用 S1/S2 的积分值 ---
+                f_val = (exp_tn * (lam_pm1 - lam_mpp1) 
+                         + (lam_pm1 * S1[n] - lam_mpp1 * S2[n])
                          - sigma)
-                if abs(f_val) < tol: break
                 
+                if abs(f_val) < tol:
+                    break
+                
+                # 导数也相应移除 dtau
                 df_val = (exp_tn * (pm1 * lam ** (p - 2) + pp1 * lam ** (-p - 2))
-                          + dtau * (pm1 * lam ** (p - 2) * S1[n]
-                                    + pp1 * lam ** (-p - 2) * S2[n]))
+                          + (pm1 * lam ** (p - 2) * S1[n]
+                             + pp1 * lam ** (-p - 2) * S2[n]))
                 
                 dlam = f_val / df_val
+                # 限制步长防止发散
                 max_step = 0.5 * lam
-                if dlam > max_step: dlam = max_step
-                elif dlam < -max_step: dlam = -max_step
+                if dlam > max_step:
+                    dlam = max_step
+                elif dlam < -max_step:
+                    dlam = -max_step
                 
                 lam_new = lam - dlam
-                if lam_new < 1.0: lam_new = 1.0 + 1e-12
+                if lam_new < 1.0:
+                    lam_new = 1.0 + 1e-12
                 if abs(lam_new - lam) < tol:
                     lam = lam_new
                     break
                 lam = lam_new
 
+            # 松弛更新
             strain_new = omega * lam + (1.0 - omega) * strain[n]
             diff = abs(strain_new - strain[n])
-            if diff > max_diff: max_diff = diff
+            if diff > max_diff:
+                max_diff = diff
             strain[n] = strain_new
 
-        if max_diff < tol: break
+        if max_diff < tol:
+            break
 
     return strain
 
@@ -229,54 +238,62 @@ def load_multi_group_data(filepath):
 #  模型预测与拟合模块
 # ====================================================================
 
-def model_predict_3params(t_exp, sigma_real, mu, p, beta, t_step_base=0.01, max_tau=50):
+def model_predict_3params(t_exp, sigma_real, mu, p, beta, solver_t_step=0.02):
     """
-    使用全局三参数模型预测蠕变曲线
+    蠕变模型预测
     
-    时间映射：
-        无量纲时间 τ = β × t_physical
-        求解器内部使用 β=1，通过调整 t_step 实现
+    求解空间: τ = β t
+    
+    求解: λ(τ)
+    
+    输出: λ(t), dλ/dt
+    
+    注意: beta只负责时间尺度转换，不参与积分步长
     """
+    # 应力无量纲化
     sigma_dimless = sigma_real / mu
-    if sigma_dimless <= 0: sigma_dimless = 1e-12
-    
-    # 物理时间 -> 无量纲时间
-    tau_max = beta * t_exp[-1]
-    if tau_max > max_tau: tau_max = max_tau
-    
-    # 计算求解器时间步长
-    dt_phys = t_exp[1] - t_exp[0] if len(t_exp) > 1 else 0.1
-    solver_t_step = beta * dt_phys
-    
-    # 粗化时间步以提高效率
-    if solver_t_step < t_step_base:
-        solver_t_step = t_step_base
-        
-    n_max = int(tau_max / solver_t_step)
-    if n_max < 2: n_max = 2
+    if sigma_dimless <= 0:
+        sigma_dimless = 1e-12
 
-    # 运行求解器
+    # 实验最大时间
+    t_max = t_exp[-1]
+    # 对应无量纲时间
+    tau_max = beta * t_max
+
+    # 固定 τ 步长
+    dtau = solver_t_step
+    n_max = int(np.ceil(tau_max / dtau)) + 1
+
+    # 求解 λ(τ)
     lam = compute_creep_gauss_seidel(
-        sigma_dimless, p=p, beta=1.0, t_step=solver_t_step, n_max=n_max,
-        max_iter=30, tol=1e-12, omega=0.7
+        sigma_dimless,
+        p=p,
+        t_step=dtau,
+        n_max=n_max,
+        max_iter=30,
+        tol=1e-12,
+        omega=0.7
     )
 
-    tau_arr = np.arange(len(lam)) * solver_t_step
-    rate_tau = compute_strain_rate(lam, solver_t_step)
-    
-    # 无量纲时间 -> 物理时间
-    t_model = tau_arr / beta
-    # 物理应变率
-    rate_phys = rate_tau * beta
+    # τ时间
+    tau_arr = np.arange(len(lam)) * dtau
 
-    # 插值到实验时间点
+    # dλ/dτ
+    rate_tau = compute_strain_rate(lam, dtau)
+
+    # 转换到物理时间, τ=βt, dλ/dt = β dλ/dτ
+    rate_phys = beta * rate_tau
+    # 转换时间
+    t_model = tau_arr / beta
+
+    # 插值到实验时间
     strain_model = np.interp(t_exp, t_model, lam)
     rate_model = np.interp(t_exp, t_model, rate_phys)
-    
+
     return strain_model, rate_model
 
 
-def compute_log_l2_loss_tail(rate_model, rate_exp, tail_ratio=0.6):
+def compute_log_l2_loss(rate_model, rate_exp, tail_ratio=0.6):
     """
     计算后 (tail_ratio)% 数据的 Log-L2 损失
     关注指数增长段的拟合质量
@@ -295,7 +312,7 @@ def compute_log_l2_loss_tail(rate_model, rate_exp, tail_ratio=0.6):
     return np.sum(log_diff ** 2)
 
 
-def objective_3params(params, groups, t_step_base, tail_ratio):
+def objective_3params(params, groups, solver_t_step, tail_ratio):
     """
     三参数目标函数
     
@@ -311,9 +328,9 @@ def objective_3params(params, groups, t_step_base, tail_ratio):
     for g in groups:
         try:
             _, rate_model = model_predict_3params(
-                g['t'], g['stress'], mu, p, beta, t_step_base=t_step_base
+                g['t'], g['stress'], mu, p, beta, solver_t_step=solver_t_step
             )
-            loss = compute_log_l2_loss_tail(rate_model, g['strain_rate'], tail_ratio=tail_ratio)
+            loss = compute_log_l2_loss(rate_model, g['strain_rate'], tail_ratio=tail_ratio)
             total_loss += loss
         except Exception:
             total_loss += 1e10
@@ -321,8 +338,8 @@ def objective_3params(params, groups, t_step_base, tail_ratio):
     return total_loss
 
 
-def fit_global_parameters(groups, t_step_base=0.02, tail_ratio=0.6,
-                          mu_init=0.1, p_init=2.0, beta_init=1.0):
+def fit_global_parameters(groups, solver_t_step=0.002, tail_ratio=0.6,
+                          mu_init=1.0, p_init=2.0, beta_init=5.0):
     """
     拟合全局三参数 (μ, p, β)
     
@@ -337,9 +354,9 @@ def fit_global_parameters(groups, t_step_base=0.02, tail_ratio=0.6,
     
     # 参数边界
     bounds = [
-        (1e-4, 10.0),     # μ: 弹性模量
+        (1e-8, 100.0),     # μ: 弹性模量
         (1.01, 10.0),     # p: 本构指数
-        (1e-3, 100.0)     # β: 链交换速率
+        (1e-8, 100.0)     # β: 链交换速率
     ]
     
     x0 = [mu_init, p_init, beta_init]
@@ -365,7 +382,7 @@ def fit_global_parameters(groups, t_step_base=0.02, tail_ratio=0.6,
             res = minimize(
                 objective_3params,
                 x0_try,
-                args=(groups, t_step_base, tail_ratio),
+                args=(groups, solver_t_step, tail_ratio),
                 method='L-BFGS-B',
                 bounds=bounds,
                 options={'ftol': 1e-9, 'gtol': 1e-7, 'maxiter': 200}
@@ -397,25 +414,16 @@ def fit_global_parameters(groups, t_step_base=0.02, tail_ratio=0.6,
         return None
 
 # ====================================================================
-#  可视化模块
+#  可视化模块 - 拆分成两张独立图
 # ====================================================================
 
-def plot_fitting_results(groups, fit_result, save_path, tail_ratio=0.6):
+def plot_strain_rate_fitting(groups, fit_result, save_path, tail_ratio=0.6):
     """
-    绘制拟合结果
-    
-    包括：
-        - 应变速率对比（log-log）
-        - 应变对比（log-linear）
-        - 拟合误差分析
+    绘制应变率拟合结果（独立图）
     """
-    fig = plt.figure(figsize=(20, 24))
-    gs = fig.add_gridspec(3, 1, hspace=0.35)
+    fig, ax = plt.subplots(figsize=(12, 8))
     
     color_cycle = ['#d62728', '#1f77b4', '#2ca02c', '#ff7f0e', '#9467bd']
-    
-    # ========== 子图1: 应变速率 ==========
-    ax_rate = fig.add_subplot(gs[0])
     
     for i, g in enumerate(groups):
         color = color_cycle[i % len(color_cycle)]
@@ -426,36 +434,53 @@ def plot_fitting_results(groups, fit_result, save_path, tail_ratio=0.6):
         strain_model, rate_model = model_predict_3params(
             t_exp, g['stress'], 
             fit_result['mu'], fit_result['p'], fit_result['beta'],
-            t_step_base=0.01
+            solver_t_step=0.002
         )
         
         # 实验数据
         mask_exp = eps_exp > 0
-        ax_rate.plot(t_exp[mask_exp], eps_exp[mask_exp], 'o', 
-                     color=color, markersize=8, alpha=0.6,
-                     label=f'Exp $\\sigma$={g["stress"]:.1e}')
+        ax.plot(t_exp[mask_exp], eps_exp[mask_exp], 'o', 
+                color=color, markersize=8, alpha=0.4,
+                label=f'Exp $\\sigma$={g["stress"]:.1e}')
         
         # 模型预测
         mask_mod = rate_model > 0
-        ax_rate.plot(t_exp[mask_mod], rate_model[mask_mod], '-', 
-                     color=color, linewidth=3,
-                     label='Model')
+        ax.plot(t_exp[mask_mod], rate_model[mask_mod], '-', 
+                color=color, linewidth=3,
+                label='Model')
         
         # 标记拟合区域
         split_idx = int(len(t_exp) * (1.0 - tail_ratio))
         if split_idx < len(t_exp):
-            ax_rate.axvline(t_exp[split_idx], color=color, linestyle=':', alpha=0.5)
-            ax_rate.axvspan(t_exp[split_idx], t_exp[-1], color=color, alpha=0.05)
+            ax.axvline(t_exp[split_idx], color=color, linestyle=':', alpha=0.5)
+            ax.axvspan(t_exp[split_idx], t_exp[-1], color=color, alpha=0.05)
     
-    ax_rate.set_yscale('log')
-    ax_rate.set_ylabel('Strain Rate $d\\lambda/dt$', fontsize=label_fontsize)
-    ax_rate.set_title(f'Strain Rate Fit ($\\mu={fit_result["mu"]:.3f}, p={fit_result["p"]:.3f}, \\beta={fit_result["beta"]:.3f}$)\n'
-                      f'Optimized on last {int(tail_ratio*100)}% (shaded)', fontsize=title_fontsize, pad=20)
-    ax_rate.legend(fontsize=legend_fontsize*0.8, loc='best', ncol=2)
-    ax_rate.grid(True, alpha=0.3)
+    ax.set_yscale('log')
+
+    ax.set_xlabel('Time $t$', fontsize=label_fontsize)
+    ax.set_ylabel('Strain Rate $d\\lambda/dt$', fontsize=label_fontsize)
+
+    ax.set_xlim(0.0, 10.0)
+
+    ax.set_title(f'Strain Rate Fit \n'
+                 f'Optimized on last {int(tail_ratio*100)}% (shaded)', fontsize=title_fontsize, pad=20)
+    ax.legend(fontsize=legend_fontsize*0.8, loc='best', ncol=1)
+    ax.grid(True, alpha=0.3)
     
-    # ========== 子图2: 应变 ==========
-    ax_strain = fig.add_subplot(gs[1])
+    # 保存图形
+    filepath = os.path.join(save_path, "strain_rate_fitting.png")
+    fig.savefig(filepath, dpi=300, bbox_inches='tight', facecolor='white')
+    plt.close()
+    print(f"  应变率拟合图已保存: {filepath}")
+
+
+def plot_strain_fitting(groups, fit_result, save_path, tail_ratio=0.6):
+    """
+    绘制应变拟合结果（独立图）
+    """
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    color_cycle = ['#d62728', '#1f77b4', '#2ca02c', '#ff7f0e', '#9467bd']
     
     for i, g in enumerate(groups):
         color = color_cycle[i % len(color_cycle)]
@@ -472,71 +497,39 @@ def plot_fitting_results(groups, fit_result, save_path, tail_ratio=0.6):
         strain_model, rate_model = model_predict_3params(
             t_exp, g['stress'], 
             fit_result['mu'], fit_result['p'], fit_result['beta'],
-            t_step_base=0.01
+            solver_t_step=0.002
         )
         strain_mod = strain_model - 1.0
         
         # 绘图
         mask_se = strain_exp > 0
-        ax_strain.plot(t_exp[mask_se], strain_exp[mask_se], 'o',
-                       color=color, markersize=8, alpha=0.6,
-                       label=f'Exp $\\sigma$={g["stress"]:.1e}')
+        ax.plot(t_exp[mask_se], strain_exp[mask_se], 'o',
+                color=color, markersize=8, alpha=0.6,
+                label=f'Exp $\\sigma$={g["stress"]:.1e}')
         mask_sm = strain_mod > 0
-        ax_strain.plot(t_exp[mask_sm], strain_mod[mask_sm], '-',
-                       color=color, linewidth=3,
-                       label='Model')
+        ax.plot(t_exp[mask_sm], strain_mod[mask_sm], '-',
+                color=color, linewidth=3,
+                label='Model')
         
         # 标记拟合区域
         split_idx = int(len(t_exp) * (1.0 - tail_ratio))
         if split_idx < len(t_exp):
-            ax_strain.axvline(t_exp[split_idx], color=color, linestyle=':', alpha=0.5)
+            ax.axvline(t_exp[split_idx], color=color, linestyle=':', alpha=0.5)
+
+    ax.set_xlabel('Time $t$', fontsize=label_fontsize)
+    ax.set_ylabel('Strain $\\lambda-1$', fontsize=label_fontsize)
+
+    ax.set_xlim(0.0, 10.0)
     
-    ax_strain.set_ylabel('Strain $\\lambda-1$', fontsize=label_fontsize)
-    ax_strain.set_title('Strain Fit', fontsize=title_fontsize, pad=20)
-    ax_strain.legend(fontsize=legend_fontsize*0.8, loc='best', ncol=2)
-    ax_strain.grid(True, alpha=0.3)
-    
-    # ========== 子图3: 拟合误差 ==========
-    ax_err = fig.add_subplot(gs[2])
-    
-    for i, g in enumerate(groups):
-        color = color_cycle[i % len(color_cycle)]
-        t_exp = g['t']
-        eps_exp = g['strain_rate']
-        
-        # 模型预测
-        strain_model, rate_model = model_predict_3params(
-            t_exp, g['stress'], 
-            fit_result['mu'], fit_result['p'], fit_result['beta'],
-            t_step_base=0.01
-        )
-        
-        # 计算相对误差（对数空间）
-        mask = (eps_exp > 0) & (rate_model > 0)
-        log_err = np.log(rate_model[mask]) - np.log(eps_exp[mask])
-        rel_err = np.abs(log_err) / np.abs(np.log(eps_exp[mask])) * 100
-        
-        ax_err.plot(t_exp[mask], rel_err, 'o-', 
-                    color=color, markersize=6, linewidth=2, alpha=0.7,
-                    label=f'$\\sigma$={g["stress"]:.1e}')
-        
-        # 标记拟合区域
-        split_idx = int(len(t_exp) * (1.0 - tail_ratio))
-        if split_idx < len(t_exp):
-            ax_err.axvline(t_exp[split_idx], color=color, linestyle=':', alpha=0.5)
-    
-    ax_err.set_xlabel('Time $t$', fontsize=label_fontsize)
-    ax_err.set_ylabel('Relative Error (%) (log scale)', fontsize=label_fontsize)
-    ax_err.set_title('Fitting Error Analysis', fontsize=title_fontsize, pad=20)
-    ax_err.legend(fontsize=legend_fontsize*0.8, loc='best')
-    ax_err.grid(True, alpha=0.3)
-    ax_err.set_ylim(0, ax_err.get_ylim()[1] * 1.1)
+    ax.set_title('Strain Fit', fontsize=title_fontsize, pad=20)
+    ax.legend(fontsize=legend_fontsize*0.8, loc='best', ncol=1)
+    ax.grid(True, alpha=0.3)
     
     # 保存图形
-    filepath = os.path.join(save_path, "fitting_results.png")
+    filepath = os.path.join(save_path, "strain_fitting.png")
     fig.savefig(filepath, dpi=300, bbox_inches='tight', facecolor='white')
     plt.close()
-    print(f"  拟合结果图已保存: {filepath}")
+    print(f"  应变拟合图已保存: {filepath}")
 
 
 def plot_parameter_comparison(fit_result, save_path, true_params=None):
@@ -585,63 +578,6 @@ def plot_parameter_comparison(fit_result, save_path, true_params=None):
     print(f"  参数对比图已保存: {filepath}")
 
 # ====================================================================
-#  生成合成数据（用于测试）
-# ====================================================================
-
-def generate_synthetic_data(n_groups=3, noise_level=0.1):
-    """
-    生成合成实验数据用于测试拟合程序
-    
-    参数：
-        n_groups: 数据组数
-        noise_level: 噪声水平
-    """
-    print("\n生成合成实验数据...")
-    
-    # 真实参数
-    true_params = {'mu': 0.5, 'p': 2.0, 'beta': 2.0}
-    
-    # 不同的应力水平
-    sigma_values = [0.05, 0.1, 0.2][:n_groups]
-    
-    # 时间轴
-    t = np.logspace(-2, 1, 100)  # 0.01 to 10
-    df_data = {}
-    
-    for i, sigma in enumerate(sigma_values):
-        # 计算理论蠕变曲线
-        sigma_dimless = sigma / true_params['mu']
-        strain = compute_creep_gauss_seidel(
-            sigma_dimless, p=true_params['p'], beta=true_params['beta'],
-            t_step=0.01, n_max=2000
-        )
-        tau = np.arange(len(strain)) * 0.01
-        rate = compute_strain_rate(strain, 0.01)
-        
-        # 插值到实验时间点
-        rate_interp = np.interp(true_params['beta'] * t, tau, rate)
-        
-        # 添加噪声
-        noise = np.random.normal(0, noise_level * rate_interp, len(rate_interp))
-        rate_noisy = rate_interp * (1 + noise)
-        
-        # 确保正值
-        rate_noisy = np.maximum(rate_noisy, rate_interp * 0.5)
-        
-        df_data[f'rate_{i}'] = rate_noisy
-        df_data[f'stress_{i}'] = np.full(len(t), sigma)
-    
-    df = pd.DataFrame(df_data)
-    
-    # 保存
-    filepath = os.path.join(save_path, 'synthetic_experimental_data.xlsx')
-    df.to_excel(filepath, index=False)
-    print(f"  合成数据已保存: {filepath}")
-    print(f"  真实参数: μ={true_params['mu']}, p={true_params['p']}, β={true_params['beta']}")
-    
-    return filepath, true_params
-
-# ====================================================================
 #  主程序
 # ====================================================================
 
@@ -650,6 +586,12 @@ def main():
     print("=" * 60)
     print("2D聚合物网络参数拟合器")
     print("=" * 60)
+
+    fit_ratio = 0.5
+    solver_t_step = 0.02
+    mu0 = 1e-2
+    p0 = 2.0
+    beta0 = 1e-1
     
     # ----------------------- 1. 数据加载 -----------------------
     data_path = os.path.join(save_path, '4d_creep_BH.xlsx')
@@ -658,7 +600,6 @@ def main():
     if not os.path.exists(data_path):
         print(f"\n实验数据文件不存在: {data_path}")
         print("生成合成数据用于测试...")
-        data_path, true_params = generate_synthetic_data(n_groups=3, noise_level=0.1)
     else:
         true_params = None
         print(f"\n加载实验数据: {data_path}")
@@ -673,11 +614,11 @@ def main():
     # ----------------------- 2. 参数拟合 -----------------------
     fit_res = fit_global_parameters(
         groups, 
-        t_step_base=0.02, 
-        tail_ratio=0.6,  # 拟合后60%数据
-        mu_init=0.5, 
-        p_init=2.0, 
-        beta_init=1.0
+        solver_t_step=solver_t_step, 
+        tail_ratio=fit_ratio,  # 拟合后60%数据
+        mu_init=mu0, 
+        p_init=p0, 
+        beta_init=beta0
     )
     
     if not fit_res:
@@ -707,7 +648,8 @@ def main():
     
     # ----------------------- 4. 可视化拟合结果 -----------------------
     print("\n生成拟合结果可视化...")
-    plot_fitting_results(groups, fit_res, save_path, tail_ratio=0.6)
+    plot_strain_rate_fitting(groups, fit_res, save_path, fit_ratio)
+    plot_strain_fitting(groups, fit_res, save_path, fit_ratio)
     
     # 如果是合成数据，绘制参数对比图
     if true_params:
@@ -721,7 +663,7 @@ def main():
         strain_model, rate_model = model_predict_3params(
             g['t'], g['stress'], 
             fit_res['mu'], fit_res['p'], fit_res['beta'],
-            t_step_base=0.01
+            solver_t_step=0.002
         )
         
         df_pred[f't_group{i+1}'] = g['t']
