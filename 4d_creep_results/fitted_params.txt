@@ -3,7 +3,7 @@
 # Fitting strategy: Last 60% of data
 
 mu   = 1.00016975e-01    # Elastic modulus
-p    = 1.96666610e+00    # Constitutive exponent
-beta = 4.80620134e+00    # Chain exchange rate
-loss = 8.56232731e+02
+p    = 3.28429149e+00    # Constitutive exponent
+beta = 8.83909936e+00    # Chain exchange rate
+loss = 9.66458322e+02
 success = False

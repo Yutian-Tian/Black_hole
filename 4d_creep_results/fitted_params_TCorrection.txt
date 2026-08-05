@@ -1,0 +1,10 @@
+# T-Correction 无量纲模型拟合参数
+# Global 4-Parameter Fit (μ, p, β, a)
+# Fitting strategy: Last 40% of data
+
+mu   = 1.55117581e-01    # Elastic modulus
+p    = 2.00000000e+00    # Constitutive exponent
+beta = 1.00000000e+01    # Time Scaling factor (Phys = Dimless * 1/beta)
+a    = 0.00000000e+00    # Strain-dependence correction factor (0<=a<=1)
+loss = 1.44989024e+03
+success = True
