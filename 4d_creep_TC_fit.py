@@ -482,9 +482,9 @@ def main():
     
     # 初始猜测点
     mu0 = 10.0
-    p0 = 2.0
+    p0 = 3.0
     beta0 = 1.5
-    a0 = 0.3
+    a0 = 0.5
 
     # 优化搜索边界 (bounds)
     param_bounds = [
