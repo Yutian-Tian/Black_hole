@@ -1,0 +1,18 @@
+# 2D Dynamic-State Elasticity + Transient Network
+# lambda(t) = exp(gamma_dot*t)
+# tau = beta*t
+# q = gamma_dot/beta
+# chi = beta*tau_xi
+
+chi = 1.0000000000e+00
+c20 = 1.0000000000e-02
+c21 = 2.0000000000e-02
+lambda_max = 3.0000000000e+00
+n_points = 1800
+
+q = gamma_dot/beta:
+  1.0000000000e-01
+  2.0000000000e-01
+  4.0000000000e-01
+  6.0000000000e-01
+  8.0000000000e-01

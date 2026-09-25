@@ -1,0 +1,19 @@
+# 2D phenomenological elastic model + transient network
+# lambda(t) = exp(gamma_dot*t)
+# tau = beta*t, q = gamma_dot/beta
+
+A  = 7.5000000000e-01
+Xs = 8.0000000000e-01
+B  = 1.5000000000e-02
+Xh = 1.8000000000e+00
+n  = 1.5000000000e+00
+
+lambda_max = 1.0000000000e+01
+n_points   = 4000
+
+q = gamma_dot/beta:
+  1.0000000000e-01
+  2.0000000000e-01
+  4.0000000000e-01
+  6.0000000000e-01
+  8.0000000000e-01
